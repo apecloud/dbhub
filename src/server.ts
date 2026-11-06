@@ -18,6 +18,7 @@ import { getToolsForSource } from "./utils/tool-metadata.js";
 import { startConfigWatcher } from "./utils/config-watcher.js";
 import { validateOrigin, buildAllowedHosts, getSelfHosts, ALLOW_ANY_HOST } from "./utils/cross-origin.js";
 import { validateAuthToken } from "./utils/auth-token.js";
+import { createInternalRouter, startSyncLoop, RuntimeSyncStore } from "./sync/runtime-sync.js";
 
 // Create __dirname equivalent for ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -65,8 +66,17 @@ v${version}${modeText} - Minimal Database MCP Server
  */
 export async function main(): Promise<void> {
   try {
+    // Runtime-sync mode: sources come from the control-plane API, not TOML/DSN.
+    // DBHub may start with zero sources and pull its snapshot after boot.
+    const runtimeSyncUrl = process.env.DBHUB_CONTROL_PLANE_URL?.trim();
+    const runtimeSyncToken = process.env.DBHUB_SYNC_TOKEN?.trim();
+
     // Resolve source configurations from TOML or fallback to single DSN
-    const sourceConfigsData = await resolveSourceConfigs();
+    let sourceConfigsData = await resolveSourceConfigs();
+
+    if (!sourceConfigsData && runtimeSyncUrl) {
+      sourceConfigsData = { sources: [], tools: undefined, source: "runtime-sync (control plane)" };
+    }
 
     if (!sourceConfigsData) {
       const samples = ConnectorRegistry.getAllSampleDSNs();
@@ -103,8 +113,11 @@ See documentation for more details on configuring database connections.
 
     console.error(`Configuration source: ${sourceConfigsData.source}`);
 
-    // Connect to database(s) - works uniformly for all modes (demo, single DSN, multi-source TOML)
-    await connectorManager.connectWithSources(sources);
+    // Connect to database(s) - works uniformly for all modes (demo, single DSN, multi-source TOML).
+    // Runtime-sync mode may legitimately start with an empty set; sources arrive via /internal/sync.
+    if (sources.length > 0) {
+      await connectorManager.connectWithSources(sources);
+    }
 
     // Initialize tool registry (manages both built-in and custom tools)
     // This must happen AFTER ConnectorManager is initialized so source validation works
@@ -199,6 +212,10 @@ See documentation for more details on configuring database connections.
     // Clean up config watcher when the process is exiting (covers both transports)
     process.on("exit", () => { stopConfigWatcher?.(); });
 
+    // Runtime-sync stop handle (populated when the HTTP server starts).
+    let stopSyncLoop: (() => void) | undefined;
+    process.on("exit", () => { stopSyncLoop?.(); });
+
     // Set up transport-specific server
     if (transportData.type === "http") {
       // HTTP transport: Start Express server with MCP endpoint and workbench
@@ -268,6 +285,23 @@ See documentation for more details on configuring database connections.
       app.get("/api/sources", listSources);
       app.get("/api/sources/:sourceId", getSource);
       app.get("/api/requests", listRequests);
+
+      // Protected runtime source sync API (control-plane push + replica pull).
+      // Requires the service token; the generic auth middleware above also runs
+      // first, so the token must satisfy both when they differ — deploy with the
+      // same DBHUB_AUTH_TOKEN/DBHUB_SYNC_TOKEN secret value.
+      let runtimeRouter: import("express").Router | undefined;
+      let runtimeStore: RuntimeSyncStore | undefined;
+      if (runtimeSyncUrl) {
+        if (!runtimeSyncToken) {
+          console.error("DBHUB_CONTROL_PLANE_URL is set but DBHUB_SYNC_TOKEN is missing; runtime sync disabled");
+        } else {
+          runtimeStore = new RuntimeSyncStore();
+          runtimeRouter = createInternalRouter(connectorManager, runtimeStore, runtimeSyncToken);
+          app.use("/internal", runtimeRouter);
+          console.error("Runtime sync API enabled on /internal/* (service-token protected)");
+        }
+      }
 
       // Main MCP endpoint. createMcpHandler serves both protocol eras from
       // the same factory: 2026-07-28 requests natively (stateless by design —
@@ -342,6 +376,21 @@ See documentation for more details on configuring database connections.
           console.error(`Workbench at http://${userHost}:${boundPort}/`);
         }
         console.error(`MCP server endpoint at http://${userHost}:${boundPort}/mcp`);
+
+        // Begin control-plane sync once the internal API is reachable.
+        if (runtimeSyncUrl && runtimeSyncToken && runtimeRouter && runtimeStore) {
+          const replicaId = process.env.DBHUB_REPLICA_ID || process.env.HOSTNAME || `replica-${process.pid}`;
+          const selfHost = process.env.DBHUB_SYNC_ADVERTISE_HOST || process.env.POD_IP || boundHost;
+          const syncUrl = `http://${selfHost}:${boundPort}/internal/sync`;
+          stopSyncLoop = startSyncLoop(runtimeRouter, connectorManager, runtimeStore, {
+            controlPlaneUrl: runtimeSyncUrl,
+            serviceToken: runtimeSyncToken,
+            replicaId,
+            syncUrl,
+            reconcileIntervalMs: Number(process.env.DBHUB_SYNC_RECONCILE_MS ?? 30_000),
+          });
+          console.error(`Runtime sync started: replica=${replicaId} control_plane=${runtimeSyncUrl} sync_url=${syncUrl}`);
+        }
       });
     } else {
       // STDIO transport: Pure MCP-over-stdio, no HTTP server. serveStdio owns
